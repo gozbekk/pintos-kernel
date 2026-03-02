@@ -1,0 +1,5 @@
+# Editor and LaTeX artifacts
+*.swp
+*.aux
+*.log
+*.out
