@@ -175,31 +175,25 @@ thread_create (const char *name, int priority,
 
   ASSERT (function != NULL);
 
-  /* Allocate thread. */
   t = palloc_get_page (PAL_ZERO);
   if (t == NULL)
     return TID_ERROR;
 
-  /* Initialize thread. */
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
 
-  /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
   kf->eip = NULL;
   kf->function = function;
   kf->aux = aux;
 
-  /* Stack frame for switch_entry(). */
   ef = alloc_frame (t, sizeof *ef);
   ef->eip = (void (*) (void)) kernel_thread;
 
-  /* Stack frame for switch_threads(). */
   sf = alloc_frame (t, sizeof *sf);
   sf->eip = switch_entry;
   sf->ebp = 0;
 
-  /* Add to run queue. */
   thread_unblock (t);
 
   if (t->priority > thread_current ()->priority)
@@ -241,7 +235,7 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  list_insert_ordered (&ready_list, &t->elem, priority_cmp, NULL);
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
@@ -312,7 +306,7 @@ thread_yield (void)
 
   old_level = intr_disable ();
   if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+    list_insert_ordered (&ready_list, &cur->elem, priority_cmp, NULL);
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -341,12 +335,15 @@ thread_set_priority (int new_priority)
 {
   struct thread *cur = thread_current ();
   cur->base_priority = new_priority;
+
   if (list_empty (&cur->donations) || new_priority > cur->priority)
     cur->priority = new_priority;
+
   if (!list_empty (&ready_list))
     {
-      struct thread *highest = list_entry (list_max (&ready_list, priority_cmp, NULL), struct thread, elem);
-      if (highest->priority > cur->priority)
+      struct thread *h = list_entry (list_max (&ready_list, priority_cmp, NULL),
+                                     struct thread, elem);
+      if (h->priority > cur->priority)
         thread_yield ();
     }
 }
@@ -517,11 +514,7 @@ next_thread_to_run (void)
   if (list_empty (&ready_list))
     return idle_thread;
   else
-  {
-    struct list_elem *e = list_max (&ready_list, priority_cmp, NULL);
-    list_remove (e);
-    return list_entry (e, struct thread, elem);
-  }
+    return list_entry (list_pop_front (&ready_list), struct thread, elem);
 }
 
 /* Completes a thread switch by activating the new thread's page

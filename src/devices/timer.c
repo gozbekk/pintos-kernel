@@ -29,6 +29,7 @@ static bool too_many_loops (unsigned loops);
 static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
+static void wake_thread (struct thread *t, void *aux UNUSED);
 static void wake_sleeping_thread (struct thread *t, void *aux UNUSED);
 
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
