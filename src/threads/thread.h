@@ -92,7 +92,9 @@ struct thread
     int64_t wake_tick;
     struct lock *lock_waiting;
     struct list donations;
-    struct list_elem donation_elem;                       /* Priority. */
+    struct list_elem donation_elem;
+    int nice;
+    int recent_cpu;                       /* Priority. */
     struct list_elem allelem;           /* List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
