@@ -45,7 +45,7 @@ priority_cmp (const struct list_elem *a, const struct list_elem *b, void *aux UN
 {
   struct thread *ta = list_entry (a, struct thread, elem);
   struct thread *tb = list_entry (b, struct thread, elem);
-  return ta->priority < tb->priority;
+  return ta->priority > tb->priority;
 }
 
 /* Initializes semaphore SEMA to VALUE.  A semaphore is a
