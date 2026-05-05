@@ -9,6 +9,7 @@
 #include "threads/flags.h"
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
+#include "threads/malloc.h"
 #include "threads/palloc.h"
 #include "threads/switch.h"
 #include "threads/synch.h"
@@ -556,6 +557,16 @@ init_thread (struct thread *t, const char *name, int priority)
   t->lock_waiting = NULL;
   list_init (&t->donations);
   t->magic = THREAD_MAGIC;
+
+#ifdef USERPROG
+  t->pagedir = NULL;
+  t->exit_status = 0;
+  t->exec_file = NULL;
+  t->my_info = NULL;
+  list_init (&t->children);
+  list_init (&t->fd_table);
+  t->next_fd = 2;
+#endif
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
