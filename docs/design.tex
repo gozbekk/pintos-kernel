@@ -1,0 +1,228 @@
+\documentclass[a4paper,11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.6cm]{geometry}
+\usepackage[colorlinks=true,urlcolor=blue,linkcolor=black]{hyperref}
+\usepackage{fancyvrb}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{enumitem}
+\usepackage{lastpage}
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Pintos Kernel: Design Document}
+\fancyhead[R]{\small G\"orkem \"Ozbek}
+\fancyfoot[C]{\small \thepage\ / \pageref{LastPage}}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.7em}
+\setlist{itemsep=0.2em}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\textbf{Pintos Kernel}\\[0.3em]\large Thread Scheduling and User Programs: Design Document}
+\author{G\"orkem \"Ozbek}
+\date{2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\section*{Overview}
+
+This document describes the design of my extensions to the Pintos x86 kernel. The work covers two areas:
+
+\begin{enumerate}
+  \item \textbf{Thread scheduling}: a non-busy-waiting alarm clock, priority scheduling with priority donation, and a 4.4BSD-style multi-level feedback queue scheduler (MLFQS).
+  \item \textbf{User programs}: argument passing, a system call layer with user-memory validation, per-process file descriptors, and parent/child process synchronisation.
+\end{enumerate}
+
+For each feature, the document presents the data structures, the algorithms, how race conditions are avoided, and the trade-offs of the design.
+
+%-------------------------------------------------------------
+\section{Alarm Clock}
+
+\subsection*{Data structures}
+\begin{Verbatim}[frame=single]
+/* struct thread (thread.h) */
+int64_t wake_tick;   /* Timer tick at which a sleeping thread must wake up. */
+\end{Verbatim}
+
+\subsection*{Algorithm}
+The original \code{timer\_sleep()} spun in a loop until enough ticks had passed, which wasted CPU time. The new version:
+\begin{enumerate}
+  \item returns immediately if the number of ticks is not positive;
+  \item computes \code{wake\_tick = timer\_ticks() + ticks};
+  \item disables interrupts, blocks the thread with \code{thread\_block()}, and restores interrupts.
+\end{enumerate}
+On every tick, the timer interrupt handler walks the threads with \code{thread\_foreach()} and unblocks each blocked thread whose \code{wake\_tick} has been reached. For each thread, the check is only two comparisons (status and tick), which keeps the time spent in the interrupt handler short.
+
+\subsection*{Synchronisation}
+Interrupts are disabled between setting \code{wake\_tick} and calling \code{thread\_block()}. A timer interrupt can therefore never try to wake a thread that is not fully blocked yet. Each thread has its own \code{wake\_tick}, so threads that call \code{timer\_sleep()} at the same time share no data.
+
+\subsection*{Trade-offs}
+The design is simple and removes busy-waiting completely. Its cost is an $O(n)$ scan of all threads on every tick. Keeping a list of sleeping threads sorted by \code{wake\_tick} would make waking them $O(1)$ in the common case.
+
+%-------------------------------------------------------------
+\section{Priority Scheduling and Priority Donation}
+
+\subsection*{Data structures}
+\begin{Verbatim}[frame=single]
+/* struct thread (thread.h) */
+int base_priority;              /* Priority before any donation.            */
+struct lock *lock_waiting;      /* Lock this thread is blocked on, if any.  */
+struct list donations;          /* Threads currently donating to us.        */
+struct list_elem donation_elem; /* Element in another thread's donations.   */
+\end{Verbatim}
+
+\subsection*{Scheduling}
+The ready list is kept ordered by priority, so the scheduler always runs the highest-priority ready thread. Semaphores and condition variables also wake their highest-priority waiter first. When a thread becomes ready with a higher priority than the running thread, the running thread yields right away.
+
+\subsection*{Donation on \code{lock\_acquire()}}
+When a high-priority thread $H$ asks for a lock held by a lower-priority thread $L$:
+\begin{enumerate}
+  \item $H$ records the lock in \code{lock\_waiting};
+  \item $H$ raises $L$'s priority to its own. If $L$ is itself waiting on another lock, the donation follows the chain of lock holders (\emph{nested donation});
+  \item $H$ is added to $L$'s \code{donations} list and blocks on the lock's semaphore;
+  \item once $H$ gets the lock, it clears \code{lock\_waiting}.
+\end{enumerate}
+
+\subsection*{Release on \code{lock\_release()}}
+The holder removes every donation tied to the released lock and recomputes its priority: the maximum of \code{base\_priority} and the remaining donations. It then releases the lock, which wakes the highest-priority waiter. If that waiter has a higher priority, the CPU is preempted immediately.
+
+\subsection*{Synchronisation}
+\code{thread\_set\_priority()} updates both \code{priority} and \code{base\_priority}. A timer interrupt in the middle of the update could make the scheduler see an inconsistent state, so the update runs with interrupts disabled. A lock cannot be used here, because acquiring a lock can itself cause a yield and donation.
+
+\subsection*{Trade-offs}
+Keeping an explicit list of donors makes multiple and nested donations easy to handle, and it makes restoring the right priority on release straightforward. Recomputing every priority from scratch would be simpler, but more expensive.
+
+%-------------------------------------------------------------
+\section{Advanced Scheduler (MLFQS)}
+
+\subsection*{Data structures}
+\begin{Verbatim}[frame=single]
+/* struct thread */
+int nice;          /* Niceness in [-20, 20]; higher means lower priority. */
+int recent_cpu;    /* Recent CPU usage, 17.14 fixed-point.                 */
+
+/* thread.c */
+static int load_avg;  /* System load average, 17.14 fixed-point. */
+\end{Verbatim}
+
+\subsection*{Algorithm}
+\begin{itemize}
+  \item On every tick, the running thread's \code{recent\_cpu} is incremented.
+  \item Once per second, \code{load\_avg} and every thread's \code{recent\_cpu} are recomputed:
+  \[ \mathit{load\_avg} = \tfrac{59}{60}\,\mathit{load\_avg} + \tfrac{1}{60}\,\mathit{ready\_threads} \]
+  \[ \mathit{recent\_cpu} = \frac{2\,\mathit{load\_avg}}{2\,\mathit{load\_avg}+1}\,\mathit{recent\_cpu} + \mathit{nice} \]
+  \item Every 4 ticks, priorities are recomputed:
+  \[ \mathit{priority} = \mathit{PRI\_MAX} - \frac{\mathit{recent\_cpu}}{4} - 2\,\mathit{nice} \]
+\end{itemize}
+
+\subsection*{Fixed-point arithmetic}
+The kernel has no floating point, so all real values use a 17.14 fixed-point format ($f = 2^{14}$), defined as small inline functions in \code{fixed-point.h}. Multiplication and division go through \code{int64\_t} to avoid overflow.
+
+\subsection*{Example trace}
+Three threads A, B and C with \code{nice} values 0, 1 and 2, all starting with \code{recent\_cpu} = 0:
+\begin{Verbatim}[frame=single]
+timer  recent_cpu    priority   thread
+ticks   A   B   C   A   B   C   to run
+-----  --  --  --  --  --  --   ------
+  0     0   0   0  63  61  59     A
+  4     4   0   0  62  61  59     A
+  8     8   0   0  61  61  59     B
+ 12     8   4   0  61  60  59     A
+ 16    12   4   0  60  60  59     B
+ 20    12   8   0  60  59  59     A
+ 24    16   8   0  59  59  59     C
+ 28    16   8   4  59  59  58     B
+ 32    16  12   4  59  58  58     A
+ 36    20  12   4  58  58  58     C
+\end{Verbatim}
+When several threads have the same priority, the one that has waited the longest runs first (round-robin).
+
+\subsection*{Trade-offs}
+All MLFQS updates run inside the timer interrupt, which keeps the values exact but makes the interrupt longer when there are many threads. The priority update is $O(n)$. Using 64 separate ready queues would make choosing the next thread $O(1)$.
+
+%-------------------------------------------------------------
+\section{Argument Passing}
+
+\code{setup\_stack()} receives the full command line and builds the initial user stack, following the 80x86 calling convention:
+\begin{enumerate}
+  \item the command line is copied into a temporary buffer and split with \code{strtok\_r()};
+  \item the argument strings are pushed from right to left;
+  \item the stack pointer is aligned to a multiple of 4 bytes;
+  \item a \code{NULL} sentinel is pushed, then the \code{argv[i]} pointers from right to left, then \code{argv}, \code{argc}, and a fake return address.
+\end{enumerate}
+Each push checks that the stack pointer stays inside the single stack page, and more than 128 arguments is rejected, so the stack page cannot overflow.
+
+\code{strtok\_r()} is used instead of \code{strtok()} because \code{strtok()} keeps its state in a hidden static buffer and is not reentrant. With \code{strtok\_r()}, the caller provides the state, which is safe in a kernel where threads can be preempted.
+
+%-------------------------------------------------------------
+\section{System Calls}
+
+Implemented calls: \code{halt}, \code{exit}, \code{exec}, \code{wait}, \code{create}, \code{remove}, \code{open}, \code{filesize}, \code{read}, \code{write}, \code{seek}, \code{tell}, \code{close}.
+
+\subsection*{Data structures}
+\begin{Verbatim}[frame=single]
+/* Shared between a parent and one of its children (thread.h). */
+struct child_info {
+    tid_t tid;
+    int exit_status;
+    bool exited;                /* Child has terminated.                 */
+    bool waited;                /* Parent already called wait().         */
+    bool load_success;          /* Result of loading the executable.     */
+    struct semaphore sema;      /* Signals load result, then exit.       */
+    struct list_elem elem;      /* Element in the parent's children.     */
+};
+
+/* Added to struct thread */
+int exit_status;
+struct list children;           /* child_info of each child.         */
+struct child_info *my_info;     /* This process's own child_info.    */
+struct file *exec_file;         /* Running executable (write-denied). */
+struct list fd_table;           /* Open file descriptors.            */
+int next_fd;                    /* Next free descriptor (from 2).    */
+
+/* One open file descriptor. */
+struct fd_entry { int fd; struct file *file; struct list_elem elem; };
+
+/* Global lock that serialises file system access. */
+struct lock filesys_lock;
+\end{Verbatim}
+
+\subsection*{File descriptors}
+Each process has its own \code{fd\_table}. \code{open()} creates a new \code{fd\_entry} with the next free number, starting at 2 (0 and 1 are the console). Descriptors are unique only within a process, and children do not inherit their parent's descriptors.
+
+\subsection*{Accessing user memory safely}
+The kernel never dereferences a user pointer before checking it:
+\begin{itemize}
+  \item \code{valid\_ptr()}: not \code{NULL}, below \code{PHYS\_BASE}, and mapped;
+  \item \code{valid\_str()}: checks every byte up to the terminating \code{NUL};
+  \item \code{valid\_buf()}: checks the whole buffer through the page table (\code{pagedir\_get\_page()}).
+\end{itemize}
+System call arguments are read from the user stack byte by byte with a fault-safe \code{get\_user()}. If any check fails, the process exits with status $-1$. Validation always happens \emph{before} \code{filesys\_lock} is acquired, so a killed process can never leave the lock held. \code{process\_exit()} then frees all resources: open files, descriptor entries and the \code{child\_info}.
+
+\subsection*{\code{wait}}
+\code{process\_wait(tid)} looks for the child in the caller's \code{children} list. If the child is not found, or was already waited for, it returns $-1$. Otherwise it marks the child as waited and, if the child has not exited yet, blocks with \code{sema\_down()} on the child's semaphore. The child stores its exit status and calls \code{sema\_up()} in \code{process\_exit()}. The parent then reads the status, removes the entry from its list and frees it.
+
+\subsection*{\code{exec}}
+After creating the child, the parent blocks on the child's semaphore. The child tries to load its executable, stores the result in \code{load\_success} and calls \code{sema\_up()}. The parent then returns the new process id, or $-1$ if loading failed. So \code{exec} never returns before the load result is known. The same semaphore is later reused to signal the child's exit to \code{wait}.
+
+While a process runs, writes to its executable file are denied. They are allowed again when it exits.
+
+\subsection*{Lifetime of \code{child\_info}}
+\code{child\_info} is allocated by the parent and freed by the parent in \code{wait}. Because the child only writes to it, and the parent frees it only after the child has exited, the child never uses freed memory.
+
+%-------------------------------------------------------------
+\section{Limitations and Future Work}
+\begin{itemize}
+  \item \textbf{Sleeping threads}: a sorted sleep list would avoid scanning every thread on each tick.
+  \item \textbf{MLFQS}: 64 per-priority ready queues would make scheduling $O(1)$.
+  \item \textbf{User buffers}: \code{valid\_buf()} checks byte by byte. Checking each page once would reduce a 4\,KB copy from up to 4096 page-table lookups to one or two.
+  \item \textbf{\code{child\_info}}: if a parent never calls \code{wait}, the entries of its children are not freed. Reference counting shared by parent and child would remove this leak.
+\end{itemize}
+
+\end{document}
